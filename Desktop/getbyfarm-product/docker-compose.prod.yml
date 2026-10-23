@@ -1,0 +1,109 @@
+# Production stack: Postgres + Django API + Next.js frontend + Caddy (automatic HTTPS) on one host.
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+name: getbyfarm
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-getbyfarm}
+      POSTGRES_USER: ${DB_USER:-getbyfarm}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env.production}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]            # never published to the host or the internet
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env.production}
+      DJANGO_ALLOWED_HOSTS: ${DOMAIN:?Set DOMAIN in .env.production}
+      CSRF_TRUSTED_ORIGINS: https://${DOMAIN}
+      HEALTHCHECK_HOST: ${DOMAIN}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-getbyfarm}
+      DB_USER: ${DB_USER:-getbyfarm}
+      DB_PASSWORD: ${DB_PASSWORD}
+      NUM_PROXIES: "1"
+      MPESA_ENABLED: ${MPESA_ENABLED:-false}
+      MPESA_ENV: ${MPESA_ENV:-sandbox}
+      MPESA_CONSUMER_KEY: ${MPESA_CONSUMER_KEY:-}
+      MPESA_CONSUMER_SECRET: ${MPESA_CONSUMER_SECRET:-}
+      MPESA_SHORTCODE: ${MPESA_SHORTCODE:-}
+      MPESA_PASSKEY: ${MPESA_PASSKEY:-}
+      MPESA_TRANSACTION_TYPE: ${MPESA_TRANSACTION_TYPE:-CustomerPayBillOnline}
+      MPESA_PARTY_B: ${MPESA_PARTY_B:-}
+      MPESA_CALLBACK_BASE_URL: https://${DOMAIN}
+      MPESA_CALLBACK_SECRET: ${MPESA_CALLBACK_SECRET:-}
+      ALLOW_MOCK_PAYMENTS: ${ALLOW_MOCK_PAYMENTS:-false}
+      I_UNDERSTAND_MOCK_PAYMENTS_ARE_FAKE: ${I_UNDERSTAND_MOCK_PAYMENTS_ARE_FAKE:-false}
+    networks: [internal]            # only reachable through Caddy
+
+  # Hourly housekeeping: cancels abandoned unpaid orders and releases the stock they reserved.
+  scheduler:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    entrypoint: []
+    command: ["sh", "-c", "while true; do python manage.py expire_unpaid_orders --hours 24; sleep 3600; done"]
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_ALLOWED_HOSTS: ${DOMAIN}
+      DB_HOST: db
+      DB_NAME: ${DB_NAME:-getbyfarm}
+      DB_USER: ${DB_USER:-getbyfarm}
+      DB_PASSWORD: ${DB_PASSWORD}
+    healthcheck:
+      disable: true
+    networks: [internal]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ""     # same-origin: /api is routed by Caddy
+    restart: unless-stopped
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [backend, frontend]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env.production}
+      MPESA_ALLOWED_IPS: ${MPESA_ALLOWED_IPS:-0.0.0.0/0 ::/0}
+      ADMIN_ALLOWED_IPS: ${ADMIN_ALLOWED_IPS:-0.0.0.0/0 ::/0}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data           # certificates: keep this volume or you'll re-issue (and hit rate limits)
+      - caddy_config:/config
+    networks: [internal, public]
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+  public:
